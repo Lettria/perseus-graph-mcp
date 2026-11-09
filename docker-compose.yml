@@ -1,0 +1,50 @@
+services:
+  # Graph database — holds the entities and relations built by Perseus,
+  # plus the :Community and :GraphChunk nodes the retriever adds.
+  neo4j:
+    image: neo4j:latest
+    ports:
+      - "7474:7474" # HTTP browser
+      - "7687:7687" # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/j4oenj4oen
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - neo4j_data:/data
+    networks:
+      - perseus_local
+    restart: unless-stopped
+
+  # Vector database — chunk and community embeddings. Required, not optional:
+  # simple-graph-retriever cannot retrieve without it.
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333" # REST
+      - "6334:6334" # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - perseus_local
+    restart: unless-stopped
+
+  # Text Embeddings Inference. bge-small-en-v1.5 emits 384-dim vectors,
+  # which must match VECTOR_SIZE in .env.
+  tei_embedder:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
+    ports:
+      - "8080:80"
+    environment:
+      - MODEL_ID=BAAI/bge-small-en-v1.5
+      - REVISION=main
+    networks:
+      - perseus_local
+    restart: unless-stopped
+
+networks:
+  perseus_local:
+    driver: bridge
+
+volumes:
+  neo4j_data:
+  qdrant_data:
