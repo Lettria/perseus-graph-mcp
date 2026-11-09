@@ -4,7 +4,7 @@ As of 1.0.0rc26, the SDK no longer talks to any embedding or LLM provider
 itself: GraphRetrievalClient / GraphIndexer / GraphRetriever require an
 `embed_fn` callback from the caller - `Callable[[list[str]], list[list[float]]]`
 - and NL2Cypher (query_natural_language / the use_nl2cypher retrieval step)
-needs an `llm_fn` - `Callable[[str], str]` - on top of that. make_embed_fn()
+needs an `llm_fn` - `Callable[[str], str]` - on top of that. make_gemini_embed_fn()
 wraps the local TEI (Text Embeddings Inference) service that docker-compose.yml
 brings up, following the SDK's own examples/tei_embedder.py. make_llm_fn()
 wraps Gemini, following the SDK README's own llm_fn example.
@@ -13,6 +13,13 @@ Used by both index.py (building the index) and server.py (embedding queries,
 and - when a Gemini key is available - NL2Cypher), so this lives here rather
 than in either.
 """
+
+from google import genai
+from google.genai import types as genai_types
+
+from perseus_client.config import settings
+from perseus_client.exceptions import PerseusException
+from typing import Callable, List, Optional, cast
 
 import logging
 import os
@@ -23,36 +30,35 @@ import requests
 logger = logging.getLogger(__name__)
 
 
-def make_embed_fn(
-    embedder_url: Optional[str] = None,
-    batch_size: int = 32,
-    max_chars: int = 500,
+def make_gemini_embed_fn(
+    genai_client: Optional[genai.Client] = None,
+    model: str = "gemini-embedding-001",
+    batch_size: int = 100,
 ) -> Callable[[List[str]], List[List[float]]]:
-    """Build an embed_fn backed by TEI.
-
-    batch_size caps each request at TEI's default max-client-batch-size (32);
-    sending more raises an HTTP 413. max_chars truncates each input - the SDK
-    used to do this truncation itself before embed_fn became caller-supplied,
-    so this preserves that behavior rather than sending TEI arbitrarily long
-    text.
-
-    A request failure (TEI down, non-200 response, ...) raises via
-    raise_for_status() rather than returning an empty vector. That is
-    deliberate: server.py's search_graph already wraps retrieve_graph() in a
-    try/except that turns any exception into a clear ToolError, which is more
-    useful than the SDK silently treating a down embedder the same as "no
-    results".
     """
-    url = embedder_url or os.environ.get("EMBEDDER_URL", "http://localhost:8080")
+    simple_graph_retriever no longer talks to any embedder itself; this
+    wires its required embed_fn callback to Gemini's embedding API instead
+    of running a local TEI container. Swap this out for Azure OpenAI,
+    OpenAI, etc. in your own code.
+
+    batch_size caps how many texts go into a single embed_content call,
+    staying under the Gemini API's per-request batch limit.
+    """
+    client = genai_client or genai.Client()
 
     def embed_fn(texts: List[str]) -> List[List[float]]:
-        truncated = [t[:max_chars] for t in texts]
         embeddings: List[List[float]] = []
-        for i in range(0, len(truncated), batch_size):
-            chunk = truncated[i : i + batch_size]
-            resp = requests.post(url, json={"inputs": chunk}, timeout=30)
-            resp.raise_for_status()
-            embeddings.extend(resp.json())
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i : i + batch_size]
+            response = client.models.embed_content(
+                model=model, contents=cast(genai_types.ContentListUnion, chunk)
+            )
+            for embedding in response.embeddings or []:
+                if embedding.values is None:
+                    raise PerseusException(
+                        f"Gemini returned no embedding values for model {model!r}."
+                    )
+                embeddings.append(embedding.values)
         return embeddings
 
     return embed_fn

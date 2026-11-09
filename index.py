@@ -477,12 +477,12 @@ def main() -> int:
         )
 
     if not args.skip_retrieval_index:
-        from embedder import make_embed_fn
+        from embedder import make_gemini_embed_fn
         from simple_graph_retriever.client import GraphRetrievalClient
 
         print("\nBuilding retrieval index (communities, chunks, embeddings)...")
         print("  note: this rebuilds the retrieval layer from scratch")
-        client = GraphRetrievalClient(embed_fn=make_embed_fn())
+        client = GraphRetrievalClient(embed_fn=make_gemini_embed_fn())
         try:
             client.index()
         finally:

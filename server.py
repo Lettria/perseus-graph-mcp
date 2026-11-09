@@ -156,7 +156,7 @@ def _get_client():
     """
     global _client
     if _client is None:
-        from embedder import make_embed_fn
+        from embedder import make_gemini_embed_fn
         from simple_graph_retriever.client import GraphRetrievalClient
 
         llm_fn = None
@@ -169,7 +169,9 @@ def _get_client():
             log.info("no Gemini key: NL2Cypher disabled")
 
         try:
-            _client = GraphRetrievalClient(embed_fn=make_embed_fn(), llm_fn=llm_fn)
+            _client = GraphRetrievalClient(
+                embed_fn=make_gemini_embed_fn(), llm_fn=llm_fn
+            )
         except Exception as exc:
             raise ToolError(
                 f"Cannot connect to the graph database ({type(exc).__name__}: {exc}). "

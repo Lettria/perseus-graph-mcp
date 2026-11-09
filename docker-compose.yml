@@ -28,19 +28,6 @@ services:
       - perseus_local
     restart: unless-stopped
 
-  # Text Embeddings Inference. bge-small-en-v1.5 emits 384-dim vectors,
-  # which must match VECTOR_SIZE in .env.
-  tei_embedder:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-latest
-    ports:
-      - "8080:80"
-    environment:
-      - MODEL_ID=BAAI/bge-small-en-v1.5
-      - REVISION=main
-    networks:
-      - perseus_local
-    restart: unless-stopped
-
 networks:
   perseus_local:
     driver: bridge

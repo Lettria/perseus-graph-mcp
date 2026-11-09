@@ -1,8 +1,7 @@
-"""Bring up the local stack (Neo4j + Qdrant + embedder) and wait until it is usable.
+"""Bring up the local stack (Neo4j + Qdrant ) and wait until it is usable.
 
 Run with:  uv run start.py
 
-The first run pulls the embedding model, which can take several minutes.
 """
 
 import argparse
@@ -64,21 +63,6 @@ def probe_qdrant():
     return f"{url}, collections: {names or '(none yet)'}"
 
 
-def probe_embedder():
-    url = os.environ.get("EMBEDDER_URL", "http://localhost:8080")
-    expected = int(os.environ.get("VECTOR_SIZE", "384"))
-    resp = requests.post(url, json={"inputs": "ping"}, timeout=30)
-    resp.raise_for_status()
-    vector = resp.json()[0]
-    if len(vector) != expected:
-        # Caught here rather than surfacing later as silently empty search results.
-        raise ValueError(
-            f"model returns {len(vector)}-dim vectors but VECTOR_SIZE={expected}; "
-            f"fix VECTOR_SIZE in .env or MODEL_ID in docker-compose.yml"
-        )
-    return f"{url}, {len(vector)}-dim vectors"
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -101,11 +85,10 @@ def main() -> int:
         print("docker compose failed; is the Docker daemon running?", file=sys.stderr)
         return result.returncode
 
-    print("\nWaiting for services (first run pulls the embedding model)...")
+    print("\nWaiting for services...")
     ok = [
         wait_for("neo4j", probe_neo4j, args.timeout),
         wait_for("qdrant", probe_qdrant, args.timeout),
-        wait_for("embedder", probe_embedder, args.timeout),
     ]
 
     if not all(ok):

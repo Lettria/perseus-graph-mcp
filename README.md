@@ -10,7 +10,7 @@ happen inside a tool call. It runs offline as a CLI step, and the MCP server onl
 read-only retrieval against the already-populated databases.
 
 ```
-start.py   docker compose up: Neo4j + Qdrant + embedder, wait until healthy
+start.py   docker compose up: Neo4j + Qdrant, wait until healthy
 index.py   folder of .md/.txt/.pdf  →  Perseus  →  Neo4j  →  retrieval index
 server.py  MCP: search_graph(query) → matching subgraph as Markdown
 ```
@@ -45,7 +45,8 @@ window (or run `source ~/.zshrc`) and try again before assuming the install fail
 
 ### Docker
 
-Runs Neo4j, Qdrant and the embedder locally.
+Runs Neo4j and Qdrant locally. (Embeddings run on Gemini's API, not a local container — see
+[Configure](#1-configure).)
 
 On macOS and Windows this means **Docker Desktop** — a GUI app, not just a CLI package.
 
@@ -95,13 +96,17 @@ way to confirm everything resolves before you start the stack.)
 cp sample.env .env
 ```
 
-Then set `PERSEUS_API_KEY` in `.env`. Every other default already matches
-`docker-compose.yml`. All three scripts load this file by absolute path, so they work
-whatever directory they are launched from.
+Then set both `PERSEUS_API_KEY` and `GEMINI_API_KEY` in `.env` — **both are required**.
+Perseus builds the graph; Gemini (`gemini-embedding-001`) embeds it, for every `index.py`
+run and every single `search_graph` call, not just the two things it used to be optional
+for. Every other default already matches `docker-compose.yml`. All three scripts load this
+file by absolute path, so they work whatever directory they are launched from.
 
-Set `GEMINI_API_KEY` too if you want PDF conversion (read whenever a PDF actually needs
-converting) or NL2Cypher (read by `server.py` on every search — see
-[How retrieval works](#how-retrieval-works)). Leave it blank to skip both; neither requires it.
+`GEMINI_API_KEY` also still covers PDF conversion (read whenever a PDF actually needs
+converting) and NL2Cypher (read by `server.py` on every search — see
+[How retrieval works](#how-retrieval-works)), which used to be the only things it did. Now
+that embeddings depend on it too, there's no skipping it the way the old optional framing
+suggested.
 
 ## 2. Start the stack
 
@@ -269,8 +274,10 @@ simple-graph-retriever also supports an LLM-driven step (NL2Cypher) that generat
 Cypher directly against the graph's schema, merging matching nodes into the same seed set as
 the vector search above. This server turns it on automatically whenever `GEMINI_API_KEY` (or
 `GOOGLE_API_KEY`) is set — `embedder.py`'s `make_llm_fn()` wraps Gemini for it, same model as
-PDF conversion. Without a key, `search_graph` sets `use_nl2cypher=False` rather than let every
-call warn about a missing `llm_fn`, and runs the vector-search-and-expand pipeline alone.
+PDF conversion. Now that embeddings run on Gemini too, that key is required regardless, so in
+practice this is always on; the `use_nl2cypher=False` fallback in `search_graph` still exists
+in code for a key-less setup, it just isn't a configuration anyone running this server
+actually has anymore.
 
 A failed Gemini call (bad key, rate limit, network) doesn't fail the search: `make_llm_fn()`
 catches it and returns `"NONE"` — the sentinel the SDK's own prompt already uses for "nothing
