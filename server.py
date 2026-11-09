@@ -159,8 +159,17 @@ def _get_client():
         from embedder import make_embed_fn
         from simple_graph_retriever.client import GraphRetrievalClient
 
+        llm_fn = None
+        if os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"):
+            from embedder import make_llm_fn
+
+            llm_fn = make_llm_fn()
+            log.info("Gemini key found: NL2Cypher enabled")
+        else:
+            log.info("no Gemini key: NL2Cypher disabled")
+
         try:
-            _client = GraphRetrievalClient(embed_fn=make_embed_fn())
+            _client = GraphRetrievalClient(embed_fn=make_embed_fn(), llm_fn=llm_fn)
         except Exception as exc:
             raise ToolError(
                 f"Cannot connect to the graph database ({type(exc).__name__}: {exc}). "
@@ -262,6 +271,13 @@ mcp = MCPServer(
     # Declared field names are snake_case; they serialise to the camelCase
     # wire form (readOnlyHint / openWorldHint) via their aliases.
     annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    # Without this the SDK auto-generates an output schema from the "-> str"
+    # return type and wraps every result in structuredContent={"result": ...}
+    # alongside the plain content block. Claude Desktop's result viewer shows
+    # that structuredContent JSON instead of rendering the markdown in
+    # content - this is a plain-text tool, there's no structured shape to
+    # preserve, so turn the wrapper off entirely.
+    structured_output=False,
 )
 def search_graph(
     query: str,
@@ -275,6 +291,7 @@ def search_graph(
 
     log.info("search_graph(query=%r, max_hops=%d)", query, max_hops)
 
+    client = _get_client()
     config = RetrievalConfig(
         max_hops=max_hops,
         max_chunks=max_chunks,
@@ -282,13 +299,12 @@ def search_graph(
         allowed_rel_types=allowed_rel_types,
         denied_rel_types=denied_rel_types,
         # Default True upstream, but it needs an llm_fn on the client to do
-        # anything; without one it just logs a warning on every call. We
-        # don't wire up an llm_fn (that's a separate feature), so keep it off
-        # rather than warn on every search.
-        use_nl2cypher=False,
+        # anything - without one it just logs a warning on every call. Gated
+        # on whether _get_client() actually built one (it does when a Gemini
+        # key is present; see embedder.make_llm_fn).
+        use_nl2cypher=client.llm_fn is not None,
     )
 
-    client = _get_client()
     try:
         # Defensive: as of 1.0.0rc26 fetch_subgraph() no longer has the bare
         # print() this redirect was written for, but index.py's indexer still

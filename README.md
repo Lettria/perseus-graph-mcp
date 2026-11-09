@@ -1,7 +1,9 @@
 # perseus-graph-mcp
 
 An MCP server that lets Claude query a knowledge graph built by
-[Perseus](https://docs.perseus.lettria.net/) from your own documents.
+[Perseus](https://docs.perseus.lettria.net/) from your own documents, using a two-level
+vector search — per-entity and per-topic — over Neo4j and Qdrant to pull back just the
+relevant subgraph for a question (see [How retrieval works](#how-retrieval-works)).
 
 Indexing is slow — Perseus uploads each file, submits a job and polls it — so it does **not**
 happen inside a tool call. It runs offline as a CLI step, and the MCP server only does fast
@@ -15,24 +17,70 @@ server.py  MCP: search_graph(query) → matching subgraph as Markdown
 
 ## 0. Install
 
-You need two things on your machine:
+You need two things on your machine: **uv** and **Docker**.
 
-- **[uv](https://docs.astral.sh/uv/getting-started/installation/)** — runs the Python scripts
-  and manages their dependencies. Installs Python 3.11+ itself if you don't already have it,
-  so there's nothing else Python-related to set up.
+### uv
 
-  ```sh
-  curl -LsSf https://astral.sh/uv/install.sh | sh        # macOS / Linux
-  ```
+Runs the Python scripts and manages their dependencies — installs Python 3.11+ itself if you
+don't already have it, so there's nothing else Python-related to set up.
 
-  ```powershell
-  powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
-  ```
+```sh
+curl -LsSf https://astral.sh/uv/install.sh | sh        # macOS / Linux
+```
 
-- **[Docker](https://docs.docker.com/get-docker/)** (with Compose, included in Docker Desktop) —
-  runs Neo4j, Qdrant and the embedder locally.
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"   # Windows
+```
 
-From the repo root, pull in the dependencies once:
+On macOS, Homebrew works too and sidesteps the gotcha below entirely:
+
+```sh
+brew install uv
+```
+
+**If `uv --version` then says "command not found," the install almost certainly worked
+anyway** — the installer adds `uv` to PATH by editing your shell's profile (`~/.zshrc` on
+macOS), but your *current* terminal doesn't reload that file on its own. Open a new terminal
+window (or run `source ~/.zshrc`) and try again before assuming the install failed.
+
+### Docker
+
+Runs Neo4j, Qdrant and the embedder locally.
+
+On macOS and Windows this means **Docker Desktop** — a GUI app, not just a CLI package.
+
+**macOS**: [download it](https://docs.docker.com/desktop/setup/install/mac-install/) (there
+are separate builds for Apple Silicon and Intel — pick the one matching your Mac), drag it
+into Applications, then **open it once** so Docker actually starts; look for the whale icon
+in the menu bar. Installing the app is not enough — `docker` and `docker compose` won't
+respond until Docker Desktop is actually running, and that's the single most common reason
+this step looks broken. Homebrew can fetch the same app:
+
+```sh
+brew install --cask docker-desktop
+```
+
+(still the same GUI app underneath — this only automates placing it in Applications; you
+still need to open it once afterward.)
+
+**Windows**: [download it](https://docs.docker.com/desktop/setup/install/windows-install/)
+and run the installer. Same rule applies — it has to actually be running (check the system
+tray for the whale icon) before `docker` commands work.
+
+**Linux**: install `docker` and the `docker compose` plugin from your distribution's package
+manager, or follow [Docker's own instructions](https://docs.docker.com/engine/install/). No
+GUI app here — the `docker` service just needs to be running (`systemctl status docker`).
+
+Verify both tools, from a new terminal if you just installed uv:
+
+```sh
+uv --version
+docker info
+```
+
+`docker info` hangs or errors until Docker Desktop (or the Linux daemon) is actually running.
+
+From the repo root, pull in uv's dependencies once:
 
 ```sh
 uv sync
@@ -51,8 +99,9 @@ Then set `PERSEUS_API_KEY` in `.env`. Every other default already matches
 `docker-compose.yml`. All three scripts load this file by absolute path, so they work
 whatever directory they are launched from.
 
-Set `GEMINI_API_KEY` too if you want to index PDFs — it is only read when a PDF actually
-needs converting, so leave it blank if you only have `.md` and `.txt`.
+Set `GEMINI_API_KEY` too if you want PDF conversion (read whenever a PDF actually needs
+converting) or NL2Cypher (read by `server.py` on every search — see
+[How retrieval works](#how-retrieval-works)). Leave it blank to skip both; neither requires it.
 
 ## 2. Start the stack
 
@@ -180,17 +229,85 @@ server, only for remote URL connectors.
 
 </details>
 
+## How retrieval works
+
+`index.py` builds two separate vector indexes over the graph, and every `search_graph` call
+searches both before walking the graph itself:
+
+- **Entity level, in the `chunks` collection.** Every node gets a short text "chunk"
+  describing its labels, properties, and up to 10 neighboring relationships, embedded and
+  indexed. This is what makes "tell me about X" questions work.
+- **Topic level, in the `communities` collection.** The Leiden algorithm partitions the whole
+  graph into communities — clusters of nodes more densely connected to each other than to the
+  rest of the graph — and each community gets a short summary of its most-connected members,
+  embedded separately. This is what lets a broader question ("what does Lettria do in
+  retail?") still find something, even when no single entity's chunk text is a close match.
+
+A `search_graph` call runs this pipeline:
+
+1. Embed the query — once, as a single vector.
+2. Vector-search `communities` for the top `max_communities` matches, and `chunks` for the
+   top `max_chunks` matches (narrowed to just those communities, when any matched). Both
+   searches apply a score threshold and stop early once the gap between consecutive scores
+   widens past a drop-off percentage, so a few strong matches aren't diluted by weak ones.
+3. Expand each matched community into up to `community_expansion_limit` of its member nodes,
+   and combine those with the chunk-matched nodes into one seed set.
+4. Walk the graph outward from every seed, up to `max_hops` hops, collecting every node and
+   relationship it touches along the way. `allowed_rel_types` / `denied_rel_types` restrict
+   which relationships that walk is allowed to follow.
+5. Return the resulting subgraph as Markdown, with the chunk/community scaffolding stripped
+   back out — only your actual entities and relationships remain.
+
+So `max_chunks` / `max_communities` control how many seeds the search starts from, and
+`max_hops` controls how far the graph is explored from each one — raising either pulls in
+more context at the cost of a longer response. It's also why a query should cover one
+subject at a time (see the tool description for examples): step 1 embeds the whole question
+into a single vector, so asking about two unrelated things at once produces a vector that
+matches neither well.
+
+simple-graph-retriever also supports an LLM-driven step (NL2Cypher) that generates and runs
+Cypher directly against the graph's schema, merging matching nodes into the same seed set as
+the vector search above. This server turns it on automatically whenever `GEMINI_API_KEY` (or
+`GOOGLE_API_KEY`) is set — `embedder.py`'s `make_llm_fn()` wraps Gemini for it, same model as
+PDF conversion. Without a key, `search_graph` sets `use_nl2cypher=False` rather than let every
+call warn about a missing `llm_fn`, and runs the vector-search-and-expand pipeline alone.
+
+A failed Gemini call (bad key, rate limit, network) doesn't fail the search: `make_llm_fn()`
+catches it and returns `"NONE"` — the sentinel the SDK's own prompt already uses for "nothing
+relevant in the schema" — so that call's vector-search results still come back normally.
+
 ## The tool
 
 `search_graph(query, max_hops=1, max_chunks=10, max_communities=3, allowed_rel_types=None,
-denied_rel_types=None)` returns the relevant subgraph as Markdown — one section per entity
-with its properties and outgoing relationships, which is compact enough to drop straight into
-a conversation. Raise `max_hops` for more context at the cost of much more text.
+denied_rel_types=None)` returns the subgraph from the pipeline above as Markdown — one
+section per entity with its properties and outgoing relationships, compact enough to drop
+straight into a conversation.
 
-The tool description and the server's `instructions` both tell the model to search before
-answering from its own knowledge, and both list the subjects actually present in the graph —
-generated from `index_manifest.json`, so they describe _your_ corpus. Without that, Claude
-tends to answer from training data and only mention the connector afterwards.
+### How the tool description is generated
+
+Both the tool description and the server's `instructions` come from `index_manifest.json` —
+written by `index.py`'s `write_manifest()` after indexing, from a few Neo4j queries: the most
+common entity labels and relationship types, up to 12 topics drawn from the `:Community.text`
+summaries the retriever already computed (each with a handful of key entity names), and the
+list of source documents. `server.py` reads that file and composes two different views of it:
+
+- The **tool description** is written prescriptively, not just informatively — "USE THIS
+  FIRST... before answering from your own knowledge" — and lists the actual subjects, entity
+  types, and relationship types present, so the model can tell whether a question is even
+  answerable from this graph before calling it. Without that framing, Claude tends to answer
+  from training data and only mention the connector afterwards.
+- The server's **`instructions`** (sent once, in the MCP `initialize` response) carry a
+  shorter version of the same pitch as standing context about the server as a whole, not
+  about this one tool.
+
+A tool description sits in the prompt prefix for every request in a conversation, not paid
+once like a result, so this stays capped at ~1200 characters rather than listing everything —
+document names beyond the first 10 collapse into a count.
+
+**Both are computed once, at server startup** — `@mcp.tool(description=...)` and
+`MCPServer(instructions=...)` evaluate them as the server starts, not per call. Re-run
+`index.py` and the description won't reflect the new corpus until the server restarts: fully
+quit and reopen Claude Desktop, or hit Restart in the Inspector.
 
 If it still answers from memory, add a line to your own Claude instructions (profile
 preferences, or a Project's instructions) such as _"for questions about Lettria, always query
