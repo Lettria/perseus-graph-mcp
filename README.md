@@ -40,7 +40,7 @@ brew install uv
 
 **If `uv --version` then says "command not found," the install almost certainly worked
 anyway** — the installer adds `uv` to PATH by editing your shell's profile (`~/.zshrc` on
-macOS), but your *current* terminal doesn't reload that file on its own. Open a new terminal
+macOS), but your _current_ terminal doesn't reload that file on its own. Open a new terminal
 window (or run `source ~/.zshrc`) and try again before assuming the install failed.
 
 ### Docker
@@ -126,7 +126,7 @@ Picks up every `.md` and `.txt` file under the folder (recursively; `--no-recurs
 flat), builds a graph per file, writes it into Neo4j, then builds the retrieval index.
 
 **PDFs are converted first.** Perseus ingests text, so each `.pdf` is sent to Gemini and
-written back as a `.md` file *next to the PDF*, which the scan then picks up like any other
+written back as a `.md` file _next to the PDF_, which the scan then picks up like any other
 source. The Markdown is a normal file you can read, edit or delete.
 
 Conversion is the one step that costs money per call rather than being reused, so a PDF is
@@ -344,19 +344,3 @@ tool will corrupt it and the server will drop off with a parse error. `server.py
 retrieval call in `contextlib.redirect_stdout(sys.stderr)` as a defensive measure against this
 — the retriever library's indexing path still prints progress, so this guards against a
 future print landing on the retrieval path too.
-
-## Development
-
-`artifact/` holds reference clones of `perseus-client` and `simple-graph-retriever`. It is
-gitignored and not used at runtime; both are installed from PyPI via `pyproject.toml`.
-
-Requires Python 3.11+ — `simple-graph-retriever` imports `typing.LiteralString`, which does
-not exist before 3.11 (its own metadata claims 3.8+).
-
-`simple-graph-retriever` 1.0.0rc26 stopped bundling an embedding provider: `GraphRetrievalClient`,
-`GraphIndexer` and `GraphRetriever` now all require an `embed_fn` callback
-(`list[str] -> list[list[float]]`) from the caller instead of talking to `EMBEDDER_URL`
-themselves. `embedder.py` supplies one backed by the local TEI service, shared by both
-`index.py` and `server.py`. This is a hard dependency floor (`>=1.0.0rc26` in
-`pyproject.toml`), not just a recommendation — earlier versions don't accept the `embed_fn`
-argument at all.
