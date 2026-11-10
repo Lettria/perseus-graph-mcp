@@ -123,9 +123,10 @@ def _describe_index() -> str:
     if docs:
         names = ", ".join(d["name"] for d in docs[:10])
         more = f", +{len(docs) - 10} more" if len(docs) > 10 else ""
+        sources = ", ".join(m.get("sources", [])) or "an indexed path"
         parts.append(
             f"\n\nThis graph was built from {len(docs)} document(s) in "
-            f"{m.get('source_folder', 'an indexed folder')}: {names}{more}."
+            f"{sources}: {names}{more}."
         )
     else:
         parts.append(f"\n\nIndexed {m.get('generated_at', 'at an unknown date')}.")
@@ -308,11 +309,11 @@ def search_graph(
     )
 
     try:
-        # Defensive: as of 1.0.0rc26 fetch_subgraph() no longer has the bare
-        # print() this redirect was written for, but index.py's indexer still
-        # prints progress elsewhere in the package, and stdout is the JSON-RPC
-        # channel on a stdio server - cheap insurance against a future one
-        # landing on this call path too.
+        # Defensive: simple-graph-retriever's fetch_subgraph() (fixed in rc26)
+        # and indexer.py (fixed in rc27) both used to have a bare print() -
+        # neither does anymore, but stdout is the JSON-RPC channel on a stdio
+        # server, so this stays as cheap insurance against a future one
+        # landing on this call path again.
         with contextlib.redirect_stdout(sys.stderr):
             result = client.retrieve_graph(query, config)
     except Exception as exc:

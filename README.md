@@ -11,7 +11,7 @@ read-only retrieval against the already-populated databases.
 
 ```
 start.py   docker compose up: Neo4j + Qdrant, wait until healthy
-index.py   folder of .md/.txt/.pdf  →  Perseus  →  Neo4j  →  retrieval index
+index.py   files and/or folders (.md/.txt/.pdf)  →  Perseus  →  Neo4j  →  retrieval index
 server.py  MCP: search_graph(query) → matching subgraph as Markdown
 ```
 
@@ -114,10 +114,9 @@ suggested.
 uv run start.py
 ```
 
-Brings up Neo4j (7474/7687), Qdrant (6333) and a TEI embedder (8080), then waits for all
-three. The embedder probe also checks that the model's vector width matches `VECTOR_SIZE`,
-which otherwise shows up much later as searches that silently return nothing. The first run
-downloads the embedding model, so allow a few minutes.
+Brings up Neo4j (7474/7687) and Qdrant (6333), then waits for both. There's no local
+embedder to wait for anymore — embeddings run on Gemini's API (see
+[Configure](#1-configure)) — so this is quick once the images are pulled.
 
 `uv run start.py --down` stops everything.
 
@@ -127,8 +126,16 @@ downloads the embedding model, so allow a few minutes.
 uv run index.py ./notes
 ```
 
-Picks up every `.md` and `.txt` file under the folder (recursively; `--no-recursive` to stay
-flat), builds a graph per file, writes it into Neo4j, then builds the retrieval index.
+Each argument is either a folder (scanned recursively for `.md`/`.txt`/`.pdf`;
+`--no-recursive` to stay flat) or an individual file — mix both in one run, e.g.:
+
+```sh
+uv run index.py --ontology schema.ttl notes/report.md notes/background.pdf
+```
+
+Builds a graph per file, writes it into Neo4j, then builds the retrieval index. The same
+file reachable twice (named directly and also inside a folder also passed) is only indexed
+once.
 
 **PDFs are converted first.** Perseus ingests text, so each `.pdf` is sent to Gemini and
 written back as a `.md` file _next to the PDF_, which the scan then picks up like any other
@@ -177,6 +184,21 @@ for.
 Use `--fresh` after removing or renaming source documents: the load is additive, so interlink
 only sees the graphs from the current run and cannot retract a node written by an earlier one.
 Job reuse makes the rebuild free.
+
+## Clearing the databases
+
+```sh
+uv run clear.py
+```
+
+Deletes every node from Neo4j and the `chunks`/`communities`/`schema` collections from
+Qdrant, then removes `index_manifest.json`. Prompts for confirmation first (`-y`/`--yes` to
+skip it); `--neo4j-only` or `--qdrant-only` narrows it to one database.
+
+This is `--fresh` without the indexing attached — reach for it when you want the databases
+empty right now, not just emptied as a side effect of the next `index.py` run. The source
+documents are untouched either way, and Perseus's job history lives server-side, so
+`index.py <path>...` afterward rebuilds without re-processing or re-billing.
 
 ## 4. Add it to Claude Desktop
 
@@ -247,6 +269,14 @@ searches both before walking the graph itself:
   rest of the graph — and each community gets a short summary of its most-connected members,
   embedded separately. This is what lets a broader question ("what does Lettria do in
   retail?") still find something, even when no single entity's chunk text is a close match.
+
+Both kinds of text are truncated to 6,000 characters before embedding (`embedder.py`'s
+`make_gemini_embed_fn`). Gemini's embedding model caps input at ~2,048 tokens and — confirmed
+by testing, not documented anywhere — doesn't error past that: it silently drops the tail
+instead, so an oversized chunk would otherwise lose part of its content to search with no
+sign anything happened. 6,000 chars leaves real margin under that limit; a warning is logged
+whenever a text actually needs cutting. Today's real chunks are nowhere near that size, since
+`simple-graph-retriever`'s own chunk-building caps context at 10 relationships per node.
 
 A `search_graph` call runs this pipeline:
 
@@ -349,5 +379,6 @@ handshake and every message exchanged.
 Log to stderr, never stdout: stdout carries the JSON-RPC protocol, so a bare `print()` in a
 tool will corrupt it and the server will drop off with a parse error. `server.py` wraps the
 retrieval call in `contextlib.redirect_stdout(sys.stderr)` as a defensive measure against this
-— the retriever library's indexing path still prints progress, so this guards against a
-future print landing on the retrieval path too.
+— simple-graph-retriever has had bare `print()`s on both its retrieval and indexing paths
+before (fixed upstream since, in rc26 and rc27 respectively), so this stays in place as cheap
+insurance against a future one landing here again.

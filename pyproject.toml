@@ -7,15 +7,8 @@ description = "An MCP server exposing Perseus graph building"
 requires-python = ">=3.11"
 dependencies = [
     "mcp>=2.3.0",
-    # The [neo4j] extras pull the driver that perseus-client's neo4j_service
-    # and simple-graph-retriever's db_adapter both import lazily.
-    "perseus-client[neo4j]>=1.0.0rc24",
-    # >=rc26: GraphRetrievalClient/GraphIndexer/GraphRetriever all require an
-    # embed_fn argument from rc26 onward (see embedder.py) - the SDK no longer
-    # talks to an embedding provider itself. Earlier versions don't accept
-    # that kwarg at all, so this is a hard floor, not just a recommendation.
-    "simple-graph-retriever[neo4j]>=1.0.0rc26",
+    "perseus-client[neo4j]>=1.0.0rc26",
+    "simple-graph-retriever[neo4j]>=1.0.0rc27",
     "python-dotenv>=1.0.0",
-    # index.py converts PDFs to Markdown with Gemini before indexing
     "google-genai>=1.41.0",
 ]

@@ -1,11 +1,12 @@
-"""Index a folder of documents into Neo4j, then build the retrieval index.
+"""Index documents into Neo4j, then build the retrieval index.
 
-Run with:  uv run index.py <folder>
+Run with:  uv run index.py <path> [<path> ...]
 
-Picks up every .md and .txt file under <folder>, sends each through Perseus
-build_graph (upload, job, poll), writes the resulting entities and relations
-into Neo4j, then runs simple-graph-retriever's indexing pass so the MCP server
-can answer queries.
+Each <path> is either a folder (scanned for .md/.txt, recursively unless
+--no-recursive) or an individual file. Every file found is sent through
+Perseus build_graph (upload, job, poll), the resulting entities and relations
+are written into Neo4j, then simple-graph-retriever's indexing pass runs so
+the MCP server can answer queries.
 
 This is the slow step - minutes, not seconds - which is exactly why it lives
 here as a CLI and not behind an MCP tool call.
@@ -58,8 +59,12 @@ PDF_PROMPT = (
 )
 
 
-def convert_pdfs(folder: Path, recursive: bool, force: bool) -> list[Path]:
-    """Convert each PDF under `folder` to Markdown beside it, using Gemini.
+def convert_pdfs(paths: list[Path], recursive: bool, force: bool) -> list[Path]:
+    """Convert each PDF among `paths` to Markdown beside it, using Gemini.
+
+    `paths` is the same mix of files and folders main() was given: a folder
+    is scanned for PDFs (recursively unless --no-recursive), a file is
+    converted directly if it's itself a PDF.
 
     The .md is written next to the .pdf so the normal scan picks it up, and so
     the conversion is visible and editable rather than hidden in a cache. A PDF
@@ -67,8 +72,15 @@ def convert_pdfs(folder: Path, recursive: bool, force: bool) -> list[Path]:
     free - conversion is the one step here that costs money per call rather
     than being reused like a Perseus job.
     """
-    walker = folder.rglob("*") if recursive else folder.glob("*")
-    pdfs = [p for p in sorted(walker) if p.is_file() and p.suffix.lower() == ".pdf"]
+    pdfs = []
+    for p in paths:
+        if p.is_dir():
+            walker = p.rglob("*") if recursive else p.glob("*")
+            pdfs.extend(
+                x for x in sorted(walker) if x.is_file() and x.suffix.lower() == ".pdf"
+            )
+        elif p.is_file() and p.suffix.lower() == ".pdf":
+            pdfs.append(p)
     if not pdfs:
         return []
 
@@ -127,19 +139,59 @@ def convert_pdfs(folder: Path, recursive: bool, force: bool) -> list[Path]:
     return converted
 
 
-def collect_files(folder: Path, recursive: bool) -> list[Path]:
-    walker = folder.rglob("*") if recursive else folder.glob("*")
-    found, skipped_empty = [], []
-    for path in sorted(walker):
-        if not path.is_file() or path.suffix.lower() not in SUFFIXES:
-            continue
+def collect_files(paths: list[Path], recursive: bool) -> list[Path]:
+    """Resolve a mix of files and folders into the concrete list of files to index.
+
+    A folder is scanned (recursively unless --no-recursive) and anything not
+    .md/.txt is silently skipped, same as before - that's expected noise in a
+    real folder. A file named directly is taken as-is if it's .md/.txt; a
+    directly-named .pdf is swapped for its .md sibling, which convert_pdfs()
+    has already written by the time this runs (see main()) - so `index.py
+    some.pdf` behaves the same as pointing at a folder containing it. Anything
+    else named directly, or a path that doesn't exist at all, is reported
+    rather than silently dropped, since naming a specific file is more likely
+    a typo than noise.
+    """
+    found, skipped_empty, skipped_other = [], [], []
+
+    def add(path: Path) -> None:
         if path.stat().st_size == 0:
             skipped_empty.append(path)
-            continue
+            return
         found.append(path)
+
+    for p in paths:
+        if p.is_dir():
+            walker = p.rglob("*") if recursive else p.glob("*")
+            for path in sorted(walker):
+                if path.is_file() and path.suffix.lower() in SUFFIXES:
+                    add(path)
+        elif p.is_file():
+            if p.suffix.lower() in SUFFIXES:
+                add(p)
+            elif p.suffix.lower() == ".pdf" and p.with_suffix(".md").exists():
+                add(p.with_suffix(".md"))
+            else:
+                skipped_other.append(p)
+        else:
+            skipped_other.append(p)
+
+    for path in skipped_other:
+        print(f"  skip (not found, or not .md/.txt/.pdf): {path}", file=sys.stderr)
     for path in skipped_empty:
         print(f"  skip (empty): {path}")
-    return found
+
+    # The same file can be reachable twice - named directly and also inside a
+    # folder also passed on the command line - which would otherwise double
+    # its Perseus job and its entity count in the merge.
+    seen: set[Path] = set()
+    deduped = []
+    for path in found:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            deduped.append(path)
+    return deduped
 
 
 def count(session, cypher: str) -> int:
@@ -247,7 +299,7 @@ def wipe_graph() -> int:
     return before
 
 
-def write_manifest(files: list[Path], folder: Path) -> dict:
+def write_manifest(files: list[Path], sources: list[Path]) -> dict:
     """Summarise what got indexed, for the server to advertise in its tool description.
 
     Everything here is derived from what Perseus and the retriever already
@@ -305,11 +357,11 @@ def write_manifest(files: list[Path], folder: Path) -> dict:
 
     manifest = {
         "generated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
-        "source_folder": str(folder),
-        "documents": [
-            {"name": str(p.relative_to(folder)), "bytes": p.stat().st_size}
-            for p in files
-        ],
+        # Plural now that main() can be given several disjoint files/folders
+        # in one run, rather than always exactly one common folder - see
+        # server.py's _describe_index(), the other reader of this field.
+        "sources": [str(p) for p in sources],
+        "documents": [{"name": p.name, "bytes": p.stat().st_size} for p in files],
         "entity_labels": labels,
         "relationship_types": rel_types,
         "topics": topics,
@@ -325,7 +377,13 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("folder", type=Path, help="folder containing .md / .txt files")
+    parser.add_argument(
+        "paths",
+        type=Path,
+        nargs="+",
+        help="files and/or folders to index - a folder is scanned for .md/.txt/.pdf, "
+        "a file is taken directly (.md, .txt, or .pdf)",
+    )
     parser.add_argument(
         "--ontology", type=Path, default=None, help="optional ontology file (TTL/OWL)"
     )
@@ -378,31 +436,30 @@ def main() -> int:
         )
         return 2
 
-    folder = args.folder.expanduser().resolve()
-    if not folder.is_dir():
-        print(f"Not a directory: {folder}", file=sys.stderr)
+    paths = [p.expanduser().resolve() for p in args.paths]
+    missing = [p for p in paths if not p.exists()]
+    if missing:
+        for p in missing:
+            print(f"Not found: {p}", file=sys.stderr)
         return 2
 
     # Converted before scanning, so the resulting .md files are picked up below.
     if not args.no_pdf:
-        print(f"Looking for PDFs under {folder}...")
-        convert_pdfs(folder, recursive=not args.no_recursive, force=args.reconvert_pdf)
+        print("Looking for PDFs...")
+        convert_pdfs(paths, recursive=not args.no_recursive, force=args.reconvert_pdf)
         print()
 
     if args.convert_only:
         print("--convert-only: stopping before indexing.")
         return 0
 
-    print(f"Scanning {folder} for {'/'.join(sorted(SUFFIXES))} files...")
-    files = collect_files(folder, recursive=not args.no_recursive)
+    print(f"Scanning for {'/'.join(sorted(SUFFIXES))} files...")
+    files = collect_files(paths, recursive=not args.no_recursive)
     if not files:
-        print(
-            f"No .md or .txt files found under {folder}. Nothing to index.",
-            file=sys.stderr,
-        )
+        print("No .md or .txt files found. Nothing to index.", file=sys.stderr)
         return 1
     for path in files:
-        print(f"  found: {path.relative_to(folder)}")
+        print(f"  found: {path}")
     print(f"{len(files)} file(s) to index.\n")
 
     if args.fresh:
@@ -489,7 +546,7 @@ def main() -> int:
             client.close()
 
     print()
-    write_manifest(files, folder)
+    write_manifest(files, paths)
 
     final = neo4j_counts()
     print("\n--- Summary ---")

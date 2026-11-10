@@ -11,3 +11,6 @@ index_manifest.json
 
 # Read-only reference clones of perseus-client / simple-graph-retriever
 artifact/
+charles-files
+ontologies
+TODO.md
