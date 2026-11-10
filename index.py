@@ -323,7 +323,13 @@ def write_manifest(files: list[Path], sources: list[Path]) -> dict:
                 {"label": r["label"], "count": r["c"]}
                 for r in s.run(
                     "MATCH (n) WHERE NOT n:GraphChunk AND NOT n:Community "
-                    "UNWIND labels(n) AS label "
+                    # _CommunityMember is the retriever's own bookkeeping tag,
+                    # added alongside the real label(s) to almost every
+                    # domain node once community detection runs - excluding
+                    # :GraphChunk/:Community nodes above doesn't catch it,
+                    # since it's a second label on an otherwise-domain node,
+                    # not a node type of its own.
+                    "UNWIND [l IN labels(n) WHERE l <> '_CommunityMember'] AS label "
                     "RETURN label, count(*) AS c ORDER BY c DESC LIMIT 15"
                 )
             ]

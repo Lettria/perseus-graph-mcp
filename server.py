@@ -148,6 +148,101 @@ def _describe_index() -> str:
     return text
 
 
+def _describe_schema() -> str:
+    """Summarise the graph's real labels/relationship types, for run_cypher's description.
+
+    Reused from index_manifest.json rather than queried fresh: this runs at
+    import time to build the tool description, same constraint as
+    _describe_index(), and the entity_labels/relationship_types index.py
+    already wrote are exactly what a model needs to write correct Cypher
+    against this specific graph instead of guessing from generic training
+    data.
+    """
+    path = ROOT / "index_manifest.json"
+    if not path.exists():
+        return (
+            "\n\nNOTE: nothing has been indexed yet, so there is no schema to "
+            "query until `index.py` has been run."
+        )
+    try:
+        m = json.loads(path.read_text())
+    except Exception as exc:  # noqa: BLE001 - a bad manifest must not break startup
+        log.warning("ignoring unreadable index_manifest.json: %s", exc)
+        return ""
+
+    labels = [entry["label"] for entry in m.get("entity_labels", [])][:15]
+    rels = [entry["type"] for entry in m.get("relationship_types", [])][:15]
+    parts = []
+    if labels:
+        parts.append(f"\n\nNode labels in the graph: {', '.join(labels)}.")
+    if rels:
+        parts.append(f"Relationship types: {', '.join(rels)}.")
+    return "\n".join(parts)
+
+
+CYPHER_DESCRIPTION = """Run a read-only Cypher query directly against the user's Neo4j graph.
+
+Use this for what search_graph's vector search structurally cannot do:
+exact counts ("how many X are there"), aggregates, exhaustive lists ("every
+Y connected to Z"), or precise multi-hop structural patterns you can name
+directly in Cypher. Prefer search_graph for anything that's really a
+semantic question - "what does X do", "tell me about Y" - raw Cypher only
+helps once you already know which labels/relationships to ask for.
+
+READ-ONLY, enforced by Neo4j itself: the session this runs in is opened in
+read access mode, so any CREATE/MERGE/DELETE/SET/REMOVE is rejected by the
+server before it can touch the graph, not filtered client-side. There is no
+way to use this tool to modify data.
+
+Every query has a 10-second server-side timeout and is capped at max_rows
+results (extra rows are dropped, not an error) - write your own LIMIT for an
+exploratory query rather than relying on max_rows, since the timeout bounds
+compute, not row count: an unindexed MATCH over the whole graph can time out
+long before max_rows would have capped it.
+
+Args:
+    query: A Cypher query. Node labels and relationship types must match the
+        graph's real schema below - invented ones simply match nothing.
+    parameters: Optional Cypher query parameters (referenced as $name in the
+        query), e.g. {"name": "Ada Lovelace"}. Prefer this over string-building
+        values into the query text.
+    max_rows: Maximum rows to return. Lower this for a quick existence check;
+        raise it for a listing you expect to be long."""
+
+
+_cypher_driver = None
+
+
+def _get_cypher_driver():
+    """Build a dedicated Neo4j driver for run_cypher, then reuse it.
+
+    Deliberately separate from _get_client()'s GraphRetrievalClient: that
+    client's own Neo4jAdapter opens plain read+write sessions internally
+    (confirmed by reading its source), so reusing it here would not give
+    run_cypher the read-only guarantee its whole design rests on. This
+    driver is only ever used to open read-access sessions - see run_cypher.
+    """
+    global _cypher_driver
+    if _cypher_driver is None:
+        from neo4j import GraphDatabase
+
+        uri = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
+        auth = (
+            os.environ.get("NEO4J_USER", "neo4j"),
+            os.environ.get("NEO4J_PASSWORD", "password"),
+        )
+        try:
+            _cypher_driver = GraphDatabase.driver(uri, auth=auth)
+            _cypher_driver.verify_connectivity()
+        except Exception as exc:
+            raise ToolError(
+                f"Cannot connect to Neo4j ({type(exc).__name__}: {exc}). "
+                f"Is the stack running? Start it with: uv run start.py"
+            ) from exc
+        log.info("connected to Neo4j for run_cypher")
+    return _cypher_driver
+
+
 def _get_client():
     """Build the retrieval client on first use, then reuse it.
 
@@ -331,6 +426,84 @@ def search_graph(
         len(result.relationships),
     )
     return result.to_markdown()
+
+
+@mcp.tool(
+    description=CYPHER_DESCRIPTION + _describe_schema(),
+    annotations=ToolAnnotations(read_only_hint=True, open_world_hint=False),
+    structured_output=False,
+)
+def run_cypher(
+    query: str,
+    parameters: dict[str, object] | None = None,
+    max_rows: int = 100,
+) -> str:
+    from itertools import islice
+    from typing import LiteralString, cast
+
+    from neo4j import READ_ACCESS, Query
+    from neo4j.exceptions import ClientError
+
+    log.info("run_cypher(query=%r, max_rows=%d)", query, max_rows)
+
+    driver = _get_cypher_driver()
+    # 10s is fixed, not a tool argument: it is the safety backstop, not a
+    # knob for the model to raise away. See CYPHER_DESCRIPTION for why this
+    # bounds compute while max_rows only bounds what comes back.
+    #
+    # Query.text is typed LiteralString - the driver's own nudge against
+    # building Cypher by interpolating untrusted values into query text. That
+    # is not what's happening here: query is this tool's entire point (an
+    # arbitrary, caller-supplied Cypher string), and untrusted values belong
+    # in `parameters` ($name placeholders), never string-built into `query`
+    # itself - exactly the separation the LiteralString constraint exists to
+    # encourage. The cast tells the type checker that, it doesn't bypass it.
+    cypher = Query(cast(LiteralString, query), timeout=10.0)
+
+    try:
+        with driver.session(default_access_mode=READ_ACCESS) as session:
+            # Defensive, same reasoning as search_graph's redirect: stdout is
+            # the JSON-RPC channel on a stdio server, and nothing here is
+            # known to print, but the cost of guarding against it is zero.
+            with contextlib.redirect_stdout(sys.stderr):
+                result = session.run(cypher, parameters or {})
+                rows = [r.data() for r in islice(result, max_rows + 1)]
+    except ClientError as exc:
+        if exc.code == "Neo.ClientError.Statement.AccessMode":
+            raise ToolError(
+                "This query would write to the graph. run_cypher is read-only "
+                "by design - Neo4j itself rejected the write, not a client-side "
+                "filter. Use index.py / clear.py to change the graph's data."
+            ) from exc
+        if (
+            exc.code
+            == "Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration"
+        ):
+            raise ToolError(
+                "This query exceeded its 10-second time limit and was cancelled "
+                "by Neo4j before producing any rows. Narrow the MATCH (filter on "
+                "a label or indexed property before expanding) or add your own "
+                "LIMIT rather than relying on max_rows, which only caps what's "
+                "returned, not how much work the query does."
+            ) from exc
+        log.exception("run_cypher failed")
+        raise ToolError(f"Cypher query failed: {exc.code}: {exc.message}") from exc
+    except Exception as exc:
+        log.exception("run_cypher failed")
+        raise ToolError(f"Cypher query failed: {type(exc).__name__}: {exc}") from exc
+
+    truncated = len(rows) > max_rows
+    if truncated:
+        rows = rows[:max_rows]
+    log.info("run_cypher returning %d row(s), truncated=%s", len(rows), truncated)
+
+    if not rows:
+        return "Query succeeded with no rows."
+
+    body = json.dumps(rows, indent=2, default=str)
+    if truncated:
+        body += f"\n\n(truncated at max_rows={max_rows}; more rows were available)"
+    return body
 
 
 if __name__ == "__main__":

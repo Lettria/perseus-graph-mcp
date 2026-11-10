@@ -313,16 +313,42 @@ A failed Gemini call (bad key, rate limit, network) doesn't fail the search: `ma
 catches it and returns `"NONE"` — the sentinel the SDK's own prompt already uses for "nothing
 relevant in the schema" — so that call's vector-search results still come back normally.
 
-## The tool
+## The tools
+
+### search_graph
 
 `search_graph(query, max_hops=1, max_chunks=10, max_communities=3, allowed_rel_types=None,
 denied_rel_types=None)` returns the subgraph from the pipeline above as Markdown — one
 section per entity with its properties and outgoing relationships, compact enough to drop
 straight into a conversation.
 
-### How the tool description is generated
+### run_cypher
 
-Both the tool description and the server's `instructions` come from `index_manifest.json` —
+`run_cypher(query, parameters=None, max_rows=100)` runs a Cypher query directly against
+Neo4j and returns the rows as JSON — for what vector search structurally can't do: exact
+counts, aggregates, exhaustive lists, or a specific multi-hop pattern you can name yourself.
+`search_graph` stays the right tool for anything that's really a semantic question.
+
+**Read-only, enforced by Neo4j itself, not a client-side filter.** The session it runs in is
+opened in read access mode, so the server rejects any `CREATE`/`MERGE`/`DELETE`/`SET`/`REMOVE`
+before it reaches the graph — confirmed directly: a `CREATE` through a read-access session
+comes back `Neo.ClientError.Statement.AccessMode`, with the node count unchanged. There is no
+way to use this tool to modify data, by design, not by convention.
+
+Every query also gets a fixed 10-second server-side timeout (confirmed the same way: a
+deliberately expensive multi-way cartesian product gets cancelled with
+`TransactionTimedOutClientConfiguration` before producing a row) and a `max_rows` cap on what
+comes back — the two bound different things. The timeout bounds how much work Neo4j does; an
+unindexed `MATCH` over the whole graph can exceed it long before `max_rows` rows exist to
+return. Write your own `LIMIT` for an exploratory query rather than leaning on `max_rows`.
+
+Like `search_graph`'s subjects list, the tool description names the graph's actual node
+labels and relationship types (from `index_manifest.json`, same mechanism as below), so the
+model writes Cypher against this graph's real schema instead of guessing generic ones.
+
+### How the tool descriptions are generated
+
+Both tool descriptions and the server's `instructions` come from `index_manifest.json` —
 written by `index.py`'s `write_manifest()` after indexing, from a few Neo4j queries: the most
 common entity labels and relationship types, up to 12 topics drawn from the `:Community.text`
 summaries the retriever already computed (each with a handful of key entity names), and the
@@ -362,7 +388,7 @@ distinction is the difference between a two-minute fix and an hour of guessing.
 npx @modelcontextprotocol/inspector uv run server.py
 ```
 
-Lists the tools and lets you call `search_graph` with arbitrary arguments.
+Lists both tools and lets you call either with arbitrary arguments.
 
 ## Logs
 
